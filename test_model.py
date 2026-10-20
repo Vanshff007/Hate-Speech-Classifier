@@ -1,39 +1,57 @@
-"""Quick check that the model loads and gives sensible predictions.
+"""Run the model on the 500 labelled cases in test_cases.py.
 
-Run with:  python test_model.py
+Run with:  python test_model.py            (summary + failures)
+           python test_model.py --all      (also print every case)
 """
-from app import LABELS, classify, load_resources
+import sys
+from collections import defaultdict
 
-SAMPLES = {
-    "clean": [
-        "Thank you for your help, have a great day!",
-        "I think this article needs more sources.",
-    ],
-    "toxic": [
-        "You are a stupid idiot and nobody likes you.",
-        "Shut up you worthless piece of garbage.",
-    ],
-}
+import numpy as np
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
-model, tokenizer, stop_words = load_resources()
-print("Model and tokenizer loaded.\n")
+from app import MAX_LEN, THRESHOLD, load_resources
+from preprocess import processing
+from test_cases import CASES
 
-scores = {}
-for group, texts in SAMPLES.items():
-    scores[group] = []
-    for text in texts:
-        probs = classify(text, model, tokenizer, stop_words)
-        assert len(probs) == 6, "model should return 6 probabilities"
-        assert all(0 <= p <= 1 for p in probs), "probabilities must be between 0 and 1"
-        scores[group].append(probs[0])  # "Toxic" score
-        print(f"[{group}] {text}")
-        for label, p in zip(LABELS, probs):
-            print(f"    {label:<14} {p:.2%}")
-        print()
 
-max_clean = max(scores["clean"])
-min_toxic = min(scores["toxic"])
-if min_toxic > max_clean:
-    print(f"PASS: toxic texts score higher ({min_toxic:.2%}) than clean texts ({max_clean:.2%}).")
-else:
-    print(f"FAIL: a clean text scored {max_clean:.2%} but a toxic text only {min_toxic:.2%}.")
+def predict(texts, model, tokenizer, stop_words):
+    clean = [processing(t, stop_words) for t in texts]
+    seqs = tokenizer.texts_to_sequences(clean)
+    padded = pad_sequences(seqs, maxlen=MAX_LEN, padding="post", truncating="post")
+    return model.predict(padded, batch_size=256, verbose=0)
+
+
+def evaluate(model, tokenizer, stop_words, show_all=False):
+    probs = predict([text for text, _, _ in CASES], model, tokenizer, stop_words)
+    scores = probs.max(axis=1)
+
+    per_category = defaultdict(lambda: [0, 0])
+    failures = []
+    for (text, expected, category), score in zip(CASES, scores):
+        predicted = bool(score >= THRESHOLD)
+        per_category[category][0] += predicted == expected
+        per_category[category][1] += 1
+        if predicted != expected:
+            failures.append((category, text, expected, score))
+        if show_all:
+            mark = "ok " if predicted == expected else "BAD"
+            print(f"{mark} [{category}] {score:6.1%}  {text}")
+
+    print(f"\n{'category':<18}{'correct':>10}")
+    for category, (ok, total) in per_category.items():
+        print(f"{category:<18}{ok:>5}/{total:<4}")
+    correct = sum(ok for ok, _ in per_category.values())
+    print(f"{'TOTAL':<18}{correct:>5}/{len(CASES)}  ({correct / len(CASES):.1%})")
+
+    if failures:
+        print(f"\n{len(failures)} failures (score = highest label probability):")
+        for category, text, expected, score in failures:
+            want = "toxic" if expected else "clean"
+            print(f"  [{category}] want {want}, got {score:.1%}: {text}")
+    return correct / len(CASES)
+
+
+if __name__ == "__main__":
+    model, tokenizer, stop_words = load_resources()
+    accuracy = evaluate(model, tokenizer, stop_words, show_all="--all" in sys.argv)
+    sys.exit(0 if accuracy >= 0.95 else 1)
